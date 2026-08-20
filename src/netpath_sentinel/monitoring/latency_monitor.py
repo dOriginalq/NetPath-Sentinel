@@ -1,8 +1,8 @@
 """
-monitoring/latency_monitor.py — RTT, Jitter Measurement
+monitoring/latency_monitor.py — RTT, Jitter, and Packet Loss Measurement
 
-Implements latency measurement via the Windows ping command and
-derives jitter from consecutive RTT samples.
+Implements latency measurement via the Windows ping command, derives jitter
+from consecutive RTT samples, and computes rolling packet loss percentage.
 
 Why subprocess ping instead of raw ICMP sockets?
     Raw ICMP sockets require Administrator privileges on Windows.
@@ -20,6 +20,11 @@ Key concepts:
         A stable connection has low jitter (e.g., ±2ms).
         High jitter degrades real-time applications even when average
         latency is acceptable — video calls and gaming are most sensitive.
+
+    Packet Loss:
+        The percentage of transmitted packets that fail to reach their
+        destination or return a reply. A loss rate > 1-2% noticeably degrades
+        browsing and streaming, while > 5% causes frequent stalls and buffering.
 """
 
 import re
@@ -77,6 +82,19 @@ def ping_once(host: str, timeout_ms: int = 1500) -> Optional[float]:
         return None
 
 
+def ping_multi(hosts: list[str], timeout_ms: int = 1500) -> dict[str, Optional[float]]:
+    """
+    Ping multiple hosts and return a dictionary mapping host -> RTT (or None).
+
+    Testing multiple distinct targets (e.g., Google DNS and Cloudflare DNS)
+    prevents false alarms if a single upstream provider has a brief anomaly.
+    """
+    results: dict[str, Optional[float]] = {}
+    for host in hosts:
+        results[host] = ping_once(host, timeout_ms=timeout_ms)
+    return results
+
+
 def calculate_jitter(rtt_history: list[float]) -> float:
     """
     Calculate jitter from a list of recent RTT measurements.
@@ -104,3 +122,23 @@ def calculate_jitter(rtt_history: list[float]) -> float:
         for i in range(1, len(rtt_history))
     ]
     return round(sum(diffs) / len(diffs), 1)
+
+
+def calculate_packet_loss(probe_history: list[bool]) -> float:
+    """
+    Calculate packet loss percentage from a rolling history of probe outcomes.
+
+    Args:
+        probe_history: List of booleans (True = success/reply received,
+                       False = timeout/failure) over recent probe attempts.
+
+    Returns:
+        Packet loss as a percentage (0.0 to 100.0), rounded to 1 decimal place.
+        Returns 0.0 if probe_history is empty.
+    """
+    if not probe_history:
+        return 0.0
+
+    total_probes = len(probe_history)
+    failed_probes = sum(1 for success in probe_history if not success)
+    return round((failed_probes / total_probes) * 100.0, 1)

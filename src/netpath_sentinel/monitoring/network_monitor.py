@@ -28,24 +28,31 @@ from typing import Optional
 
 import psutil
 
-from netpath_sentinel.monitoring.latency_monitor import ping_once, calculate_jitter
-from netpath_sentinel.monitoring.connectivity import check_tcp_connect, get_active_interface
+from netpath_sentinel.monitoring.latency_monitor import (
+    ping_once,
+    calculate_jitter,
+    calculate_packet_loss,
+)
+from netpath_sentinel.monitoring.connectivity import (
+    check_tcp_connect,
+    get_active_interface,
+    evaluate_health_status,
+    DEFAULT_PROBE_TARGETS,
+)
 
 
 # ── Monitoring targets ────────────────────────────────────────────────────────
 #
-# We use Google's public DNS server (8.8.8.8) as our primary probe target.
-# Reasons:
-#   - Globally reachable, extremely reliable
-#   - Low latency from most locations
-#   - Both ICMP ping (latency) and TCP/443 (connectivity) are supported
-#   - Not a single-point-of-failure for our measurements
-#
-PROBE_HOST     = "8.8.8.8"   # Google DNS — primary latency + connectivity probe
+# Primary: Google DNS (8.8.8.8), Secondary: Cloudflare DNS (1.1.1.1).
+# Using multiple endpoints avoids false alarms if one provider drops packets.
+PROBE_HOSTS    = ["8.8.8.8", "1.1.1.1"]
+PRIMARY_HOST   = "8.8.8.8"
+SECONDARY_HOST = "1.1.1.1"
 PROBE_PORT     = 443          # HTTPS port — rarely blocked by ISPs
 
 LOOP_INTERVAL  = 3            # Seconds between full measurement cycles
-MAX_HISTORY    = 60           # Maximum rolling-window samples to keep
+MAX_HISTORY    = 60           # Maximum rolling-window samples to keep for charts
+PROBE_WINDOW   = 20           # Window size for packet loss calculation
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -65,22 +72,34 @@ class NetworkState:
     before the first monitoring cycle completes.
     """
 
-    # ── Connectivity ──────────────────────────────────────────────────────
+    # ── Connectivity & Health ─────────────────────────────────────────────
     is_connected: bool = False
-    """True if we successfully reached PROBE_HOST via TCP."""
+    """True if we successfully reached at least one probe host via TCP."""
 
     interface_name: str = "—"
     """Name of the active network interface (e.g., 'Wi-Fi', 'Ethernet')."""
 
-    # ── Latency ───────────────────────────────────────────────────────────
-    latency_ms: float = 0.0
-    """Most recent RTT to PROBE_HOST in milliseconds."""
+    health_status: str = "disconnected"
+    """One of: 'healthy', 'degraded', 'disconnected'."""
 
-    latency_history: list = field(default_factory=list)
+    health_reason: str = "Initializing monitor…"
+    """Human-readable explanation of the current health state."""
+
+    # ── Latency & Reliability ─────────────────────────────────────────────
+    latency_ms: float = 0.0
+    """Most recent RTT to probe target in milliseconds."""
+
+    latency_history: list[float] = field(default_factory=list)
     """Rolling history of RTT values, oldest → newest (max MAX_HISTORY entries)."""
 
     jitter_ms: float = 0.0
     """Mean absolute difference between consecutive RTT values (ms)."""
+
+    packet_loss_pct: float = 0.0
+    """Percentage of probe pings lost in the recent rolling window (0.0 - 100.0)."""
+
+    probe_history: list[bool] = field(default_factory=list)
+    """Rolling history of ping outcomes (True=success, False=lost)."""
 
     # ── Bandwidth ─────────────────────────────────────────────────────────
     download_kbps: float = 0.0
@@ -89,10 +108,10 @@ class NetworkState:
     upload_kbps: float = 0.0
     """Current upload throughput in KB/s."""
 
-    download_history: list = field(default_factory=list)
+    download_history: list[float] = field(default_factory=list)
     """Rolling history of download KB/s samples."""
 
-    upload_history: list = field(default_factory=list)
+    upload_history: list[float] = field(default_factory=list)
     """Rolling history of upload KB/s samples."""
 
     # ── Timing ────────────────────────────────────────────────────────────
@@ -130,7 +149,6 @@ class NetworkMonitor:
         self._thread: Optional[threading.Thread] = None
 
         # Bandwidth sampling requires two consecutive readings.
-        # These store the previous reading so we can compute the diff.
         self._prev_recv: int   = 0
         self._prev_sent: int   = 0
         self._prev_time: float = 0.0
@@ -148,9 +166,13 @@ class NetworkMonitor:
             return NetworkState(
                 is_connected      = s.is_connected,
                 interface_name    = s.interface_name,
+                health_status     = s.health_status,
+                health_reason     = s.health_reason,
                 latency_ms        = s.latency_ms,
-                latency_history   = list(s.latency_history),   # shallow copy of list of floats
+                latency_history   = list(s.latency_history),
                 jitter_ms         = s.jitter_ms,
+                packet_loss_pct   = s.packet_loss_pct,
+                probe_history     = list(s.probe_history),
                 download_kbps     = s.download_kbps,
                 upload_kbps       = s.upload_kbps,
                 download_history  = list(s.download_history),
@@ -168,7 +190,7 @@ class NetworkMonitor:
         self._thread = threading.Thread(
             target=self._run,
             name="NetPathMonitor",
-            daemon=True,   # exits automatically when the main process exits
+            daemon=True,
         )
         self._thread.start()
         print("[Monitor] Background monitoring started.")
@@ -187,12 +209,13 @@ class NetworkMonitor:
         Main monitoring loop — runs on the background thread.
 
         Each cycle (every LOOP_INTERVAL seconds):
-            1. Sample bandwidth  — reads OS byte counters (fast, ~1ms)
-            2. Find active interface — queries psutil (fast, ~5ms)
-            3. Check TCP connectivity — opens a socket (up to 2s)
-            4. Ping for RTT — runs ping.exe (up to 1.5s)
-            5. Update shared state under lock
-            6. Sleep for the remaining cycle time
+            1. Sample bandwidth  — reads OS byte counters
+            2. Find active interface — queries psutil
+            3. Check TCP connectivity to targets
+            4. Measure RTT & Packet Loss via ping
+            5. Evaluate composite health status
+            6. Update shared state under lock
+            7. Sleep for remainder of the cycle
         """
         print("[Monitor] Monitoring loop started.")
 
@@ -200,33 +223,49 @@ class NetworkMonitor:
             cycle_start = time.monotonic()
 
             # ── 1. Sample bandwidth ───────────────────────────────────────
-            # Read system-wide byte counters and compute KB/s.
             dl_kbps, ul_kbps = self._sample_bandwidth()
 
             # ── 2. Detect active interface ────────────────────────────────
-            # Find which NIC is carrying traffic.
             interface = get_active_interface()
 
-            # ── 3. Check connectivity ─────────────────────────────────────
-            # TCP connect to 8.8.8.8:443. This tells us whether the Internet
-            # path is clear at the transport layer, independent of DNS.
+            # ── 3. Check TCP connectivity ─────────────────────────────────
             connected = False
             if interface:
-                connected = check_tcp_connect(PROBE_HOST, PROBE_PORT, timeout=2.0)
+                for host, port in DEFAULT_PROBE_TARGETS:
+                    if check_tcp_connect(host, port, timeout=1.5):
+                        connected = True
+                        break
 
-            # ── 4. Measure RTT via ping ───────────────────────────────────
-            # Only ping if we believe we're online — avoids waiting 1.5s
-            # for a timeout when we already know we're offline.
+            # ── 4. Measure RTT & Ping Probe ───────────────────────────────
             rtt: Optional[float] = None
-            if connected:
-                rtt = ping_once(PROBE_HOST, timeout_ms=1500)
+            ping_success = False
 
-            # ── 5. Update shared state ────────────────────────────────────
+            if connected:
+                # Try primary host first
+                rtt = ping_once(PRIMARY_HOST, timeout_ms=1200)
+                if rtt is not None:
+                    ping_success = True
+                else:
+                    # Failover to secondary host
+                    rtt_sec = ping_once(SECONDARY_HOST, timeout_ms=1200)
+                    if rtt_sec is not None:
+                        rtt = rtt_sec
+                        ping_success = True
+
+            # ── 5. Update shared state & health classification ────────────
             with self._lock:
                 s = self._state
 
-                s.is_connected    = connected
-                s.interface_name  = interface or "—"
+                s.is_connected   = connected
+                s.interface_name = interface or "—"
+
+                # Record ping success/loss outcome in rolling probe history
+                if connected:
+                    _append(s.probe_history, ping_success, PROBE_WINDOW)
+                else:
+                    _append(s.probe_history, False, PROBE_WINDOW)
+
+                s.packet_loss_pct = calculate_packet_loss(s.probe_history)
 
                 # Bandwidth
                 s.download_kbps = dl_kbps
@@ -234,46 +273,45 @@ class NetworkMonitor:
                 _append(s.download_history, dl_kbps, MAX_HISTORY)
                 _append(s.upload_history,   ul_kbps, MAX_HISTORY)
 
-                # Latency + jitter
+                # Latency & Jitter
                 if rtt is not None:
                     s.latency_ms = rtt
                     _append(s.latency_history, rtt, MAX_HISTORY)
-                    # Compute jitter from the last 10 RTT samples for responsiveness
                     s.jitter_ms = calculate_jitter(s.latency_history[-10:])
+                elif not connected:
+                    s.latency_ms = 0.0
+                    s.jitter_ms = 0.0
 
-                s.last_updated = datetime.now()
+                # Health evaluation
+                status, reason = evaluate_health_status(
+                    is_connected=s.is_connected,
+                    packet_loss_pct=s.packet_loss_pct,
+                    latency_ms=s.latency_ms,
+                    jitter_ms=s.jitter_ms,
+                )
+                s.health_status = status
+                s.health_reason = reason
+                s.last_updated  = datetime.now()
 
             # ── 6. Sleep for the remainder of the cycle ───────────────────
-            # self._stop_event.wait() is an interruptible sleep:
-            # if stop() is called, the wait returns immediately.
-            elapsed    = time.monotonic() - cycle_start
-            sleep_for  = max(0.0, LOOP_INTERVAL - elapsed)
+            elapsed   = time.monotonic() - cycle_start
+            sleep_for = max(0.0, LOOP_INTERVAL - elapsed)
             self._stop_event.wait(sleep_for)
 
         print("[Monitor] Monitoring loop exited.")
 
     def _sample_bandwidth(self) -> tuple[float, float]:
-        """
-        Compute current download and upload speed in KB/s.
-
-        Strategy: psutil.net_io_counters() returns *cumulative* bytes
-        transferred since the process started. By reading it twice and
-        dividing the difference by elapsed time, we get bytes/second.
-
-        On the first call we only record the baseline — returns (0, 0).
-        On subsequent calls we compute the actual throughput.
-        """
+        """Compute current download and upload speed in KB/s."""
         now = time.monotonic()
 
         try:
-            c = psutil.net_io_counters()   # system-wide totals across all interfaces
+            c = psutil.net_io_counters()
             recv = c.bytes_recv
             sent = c.bytes_sent
         except Exception:
             return 0.0, 0.0
 
         if self._prev_time == 0.0:
-            # First call — record baseline, return zeroes
             self._prev_recv = recv
             self._prev_sent = sent
             self._prev_time = now
@@ -283,7 +321,6 @@ class NetworkMonitor:
         if dt <= 0:
             return 0.0, 0.0
 
-        # bytes/sec → KB/s (divide by 1024)
         dl_kbps = (recv - self._prev_recv) / dt / 1024
         ul_kbps = (sent - self._prev_sent) / dt / 1024
 
@@ -291,14 +328,13 @@ class NetworkMonitor:
         self._prev_sent = sent
         self._prev_time = now
 
-        # Clamp to >= 0 in case of counter wrap or system anomaly
         return max(0.0, dl_kbps), max(0.0, ul_kbps)
 
 
 # ── Utility ───────────────────────────────────────────────────────────────────
 
-def _append(history: list, value: float, max_len: int) -> None:
-    """Append a value to a rolling history list, evicting the oldest if full."""
+def _append(history: list, value, max_len: int) -> None:
+    """Append a value to a rolling history list, evicting oldest if full."""
     history.append(value)
     if len(history) > max_len:
         history.pop(0)

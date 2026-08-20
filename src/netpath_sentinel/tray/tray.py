@@ -4,27 +4,37 @@ tray/tray.py — System Tray Icon and Context Menu
 Manages the Windows system tray icon, which is the primary
 user-facing component of NetPath Sentinel.
 
-Changes from Milestone 1:
-    - Now accepts a NetworkMonitor instance and passes it to DashboardWindow.
-    - The tray icon color will eventually reflect network state (Milestone 4+).
-      For now it always shows green (the monitor has started).
+Milestone 4 updates:
+    - Tray icon dynamically updates color based on health status:
+        * Healthy    -> Green  (#22c55e)
+        * Degraded   -> Orange (#f59e0b)
+        * Disconnected -> Red  (#ef4444)
+    - Tooltip dynamically shows live network state (latency, loss, status)
+    - Periodic QTimer on UI thread syncs tray icon with monitor state
 """
 
 from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QBrush
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 
 from netpath_sentinel.ui.dashboard import DashboardWindow
 from netpath_sentinel.monitoring.network_monitor import NetworkMonitor
 
 
-def _create_tray_icon(connected: bool = True) -> QIcon:
+_COLOR_MAP = {
+    "healthy":      "#22c55e",
+    "degraded":     "#f59e0b",
+    "disconnected": "#ef4444",
+}
+
+
+def _create_tray_icon(status: str = "healthy") -> QIcon:
     """
     Draw a WiFi-style tray icon programmatically using Qt's painter API.
 
     Drawing in code (rather than loading an image file) lets us update the
     icon color dynamically to reflect network state changes:
-        Green  (#22c55e) = connected / healthy
+        Green  (#22c55e) = healthy
         Orange (#f59e0b) = degraded
         Red    (#ef4444) = disconnected
 
@@ -37,7 +47,8 @@ def _create_tray_icon(connected: bool = True) -> QIcon:
     painter = QPainter(px)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-    color = QColor("#22c55e") if connected else QColor("#ef4444")
+    hex_color = _COLOR_MAP.get(status, "#22c55e")
+    color = QColor(hex_color)
 
     # Dark circle background
     painter.setBrush(QBrush(QColor("#1a1d24")))
@@ -65,8 +76,8 @@ class TrayIcon(QSystemTrayIcon):
     """
     The NetPath Sentinel system tray icon.
 
-    Holds references to both the NetworkMonitor (for future status-based
-    icon updates) and the DashboardWindow (to show/hide on click).
+    Holds references to both the NetworkMonitor (for dynamic status-based
+    icon and tooltip updates) and the DashboardWindow (to show/hide on click).
     """
 
     def __init__(self, app: QApplication, monitor: NetworkMonitor) -> None:
@@ -74,17 +85,42 @@ class TrayIcon(QSystemTrayIcon):
 
         self._app     = app
         self._monitor = monitor
+        self._current_status = "healthy"
 
         # Create the dashboard window once; reuse it across show/hide cycles
         self._dashboard = DashboardWindow(monitor)
 
-        self.setIcon(_create_tray_icon(connected=True))
-        self.setToolTip("NetPath Sentinel — Monitoring")
+        self.setIcon(_create_tray_icon("healthy"))
+        self.setToolTip("NetPath Sentinel — Initializing")
 
         self._build_menu()
 
         # Single left-click toggles the dashboard
         self.activated.connect(self._on_activated)
+
+        # Periodic timer to update tray icon and tooltip based on monitor state
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._sync_tray_state)
+        self._timer.start(2500)
+
+    def _sync_tray_state(self) -> None:
+        """Update the tray icon and tooltip to reflect monitor health status."""
+        state = self._monitor.state
+        status = state.health_status
+
+        if status != self._current_status:
+            self._current_status = status
+            self.setIcon(_create_tray_icon(status))
+
+        # Format tooltip
+        if status == "healthy":
+            tip = f"NetPath Sentinel — Healthy ({state.latency_ms:.0f}ms · {state.packet_loss_pct:.0f}% loss)"
+        elif status == "degraded":
+            tip = f"NetPath Sentinel — Degraded ({state.health_reason})"
+        else:
+            tip = f"NetPath Sentinel — Disconnected ({state.interface_name})"
+
+        self.setToolTip(tip)
 
     def _build_menu(self) -> None:
         menu = QMenu()

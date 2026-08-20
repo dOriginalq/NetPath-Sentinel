@@ -27,6 +27,43 @@ This will be the primary design reference for Milestone 2.
 
 ---
 
+## 2026-08-20 — Milestone 1: Basic Tray Application
+
+**Status**: ✅ Complete
+
+### What was done
+
+- Implemented `main.py` — Qt application entry, `setQuitOnLastWindowClosed(False)`, starts tray
+- Implemented `tray/tray.py` — `QSystemTrayIcon` with:
+  - Programmatic WiFi-style tray icon drawn with `QPainter` (no external image files needed)
+  - Context menu: **Open Dashboard** / **Exit NetPath Sentinel**
+  - Left-click toggles dashboard show/hide
+  - Dashboard positioned near bottom-right corner (system tray area)
+- Implemented `ui/styles.py` — full QSS stylesheet with documented color palette
+- Implemented `ui/dashboard.py` — frameless dark popup with:
+  - Custom drag-to-move title bar (no OS chrome)
+  - Close/minimize buttons that **hide** (not quit) the app
+  - M1 placeholder body explaining tray behaviour
+- Created `tests/test_milestone1.py` — 9 smoke tests (all passed)
+- Verified: app starts, Qt event loop holds, no errors after 5s, clean termination
+
+### Key learnings
+
+- `QApplication.setQuitOnLastWindowClosed(False)` is the critical setting that makes a tray app possible — without it, Qt exits when the popup is closed
+- `Qt.WindowType.Tool` prevents the app from appearing in the taskbar
+- Frameless windows need manual mouse event tracking for drag-to-move
+- A `QSystemTrayIcon` requires a running `QApplication` to display
+
+### Testing results
+
+```
+9 passed in 0.13s
+App process state after 5s: Running
+No errors or tracebacks
+```
+
+---
+
 ## 2026-08-20 — Milestone 2: Popup Dashboard UI
 
 **Status**: ✅ Complete
@@ -67,38 +104,77 @@ No errors or tracebacks
 
 ---
 
-
+## 2026-08-20 — Milestone 3: Basic Network Monitoring
 
 **Status**: ✅ Complete
 
 ### What was done
 
-- Implemented `main.py` — Qt application entry, `setQuitOnLastWindowClosed(False)`, starts tray
-- Implemented `tray/tray.py` — `QSystemTrayIcon` with:
-  - Programmatic WiFi-style tray icon drawn with `QPainter` (no external image files needed)
-  - Context menu: **Open Dashboard** / **Exit NetPath Sentinel**
-  - Left-click toggles dashboard show/hide
-  - Dashboard positioned near bottom-right corner (system tray area)
-- Implemented `ui/styles.py` — full QSS stylesheet with documented color palette
-- Implemented `ui/dashboard.py` — frameless dark popup with:
-  - Custom drag-to-move title bar (no OS chrome)
-  - Close/minimize buttons that **hide** (not quit) the app
-  - M1 placeholder body explaining tray behaviour
-- Created `tests/test_milestone1.py` — 9 smoke tests (all passed)
-- Verified: app starts, Qt event loop holds, no errors after 5s, clean termination
-
-### Key learnings
-
-- `QApplication.setQuitOnLastWindowClosed(False)` is the critical setting that makes a tray app possible — without it, Qt exits when the popup is closed
-- `Qt.WindowType.Tool` prevents the app from appearing in the taskbar
-- Frameless windows need manual mouse event tracking for drag-to-move
-- A `QSystemTrayIcon` requires a running `QApplication` to display
+- Implemented `monitoring/latency_monitor.py`:
+  - `ping_once(host, timeout_ms)` via non-admin subprocess `ping.exe`
+  - `calculate_jitter(rtt_history)` computing mean absolute difference between consecutive RTT samples
+- Implemented `monitoring/connectivity.py`:
+  - `check_tcp_connect(host, port, timeout)` using raw socket TCP handshakes (bypassing ICMP blocks)
+  - `get_active_interface()` detecting active NIC via `psutil`
+- Implemented `monitoring/network_monitor.py`:
+  - `NetworkState` thread-safe dataclass contract between background monitor and Qt UI
+  - `NetworkMonitor` daemon thread with 3-second background polling cycle
+  - Real-time bandwidth differencing from `psutil.net_io_counters()`
+- Wired real data into `ui/dashboard.py` and `ui/charts.py`:
+  - `QTimer` refreshing UI metrics every 2 seconds
+  - Live upload/download Mbps, RTT latency, jitter, interface name, and uptime counter
+  - Dynamic auto-scaling pyqtgraph charts for latency and bandwidth
+- Created `tests/test_milestone3.py` — 17 unit and integration tests (34 total tests passing)
 
 ### Testing results
 
 ```
-9 passed in 0.13s
-App process state after 5s: Running
+34 passed in 0.81s
+App process state after 8s: Running
+No errors or tracebacks
+```
+
+---
+
+## 2026-08-20 — Milestone 4: Connectivity Health Monitoring
+
+**Status**: ✅ Complete
+
+### What was done
+
+- **Multi-Target Probing & Failover**:
+  - Implemented multi-target TCP connectivity checks against high-availability endpoints (`8.8.8.8` and `1.1.1.1` on port 443).
+  - Implemented multi-host ping failover in `monitoring/latency_monitor.py` (`ping_multi` and secondary fallback in `NetworkMonitor`).
+- **Packet Loss Calculation**:
+  - Implemented `calculate_packet_loss()` computing loss percentage over a rolling window of recent probe attempts.
+  - Added `packet_loss_pct` and `probe_history` to `NetworkState`.
+- **Health State Classification**:
+  - Implemented `evaluate_health_status()` in `monitoring/connectivity.py`:
+    - `healthy`: Connected, packet loss < 2%, latency < 120ms, jitter < 25ms.
+    - `degraded`: Connected, but experiencing packet loss, high latency (>= 120ms), or high jitter (>= 25ms).
+    - `disconnected`: Interface down, total probe failure, or 100% packet loss.
+  - Added `health_status` and `health_reason` to `NetworkState`.
+- **Dynamic System Tray Icon & Tooltip**:
+  - Updated `_create_tray_icon()` in `tray/tray.py` to draw state-aware colors:
+    - Green (`#22c55e`) for healthy
+    - Orange (`#f59e0b`) for degraded
+    - Red (`#ef4444`) for disconnected
+  - Added periodic `QTimer` in `TrayIcon` that synchronizes the icon and displays live latency/packet loss metrics in the tooltip.
+- **Enhanced Dashboard UI**:
+  - Updated `_StatusIndicator` in `ui/dashboard.py` to render 3 distinct visual states:
+    - Checkmark (healthy)
+    - Exclamation mark (degraded)
+    - Cross mark (disconnected)
+  - Wired live `Packet Loss %` metric cell in grid 1 with color coding (Green <= 1%, Orange <= 10%, Red > 10%).
+  - Added dynamic health anomaly details to status card subtitle.
+- **Automated Tests**:
+  - Added `tests/test_milestone4.py` with 14 new tests covering packet loss calculation, health classification edge cases, icon generation, and state immutability (48 total tests passing).
+
+### Testing results
+
+```
+48 passed in 0.80s
+App process state after 8s: Running
 No errors or tracebacks
 ```
 

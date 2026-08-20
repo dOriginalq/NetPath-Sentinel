@@ -1,23 +1,19 @@
 """
 ui/dashboard.py — Full Popup Dashboard Window
 
-Milestone 3: _DashboardView now accepts the NetworkMonitor and refreshes
-live measurements every 2 seconds via a QTimer.
+Milestone 4: Enhanced Connection Health Monitoring UI.
 
-What changed from Milestone 2:
-    - DashboardWindow accepts a NetworkMonitor parameter
-    - _DashboardView stores references to all updateable labels/widgets
-    - _DashboardView._refresh() reads monitor.state and updates the UI
-    - _StatusIndicator gains a set_connected() method
-    - Charts update with real latency and bandwidth history
-    - Placeholder values (—) are replaced with live readings as they arrive
-
-What is still placeholder at Milestone 3:
-    - DNS response time (Milestone 5)
-    - IPv4 / IPv6 status (Milestone 5)
-    - Packet loss % (Milestone 4)
-    - Recent events list (Milestone 6)
-    - Network details / public IP / ASN (Milestone 8)
+What changed from Milestone 3:
+    - _StatusIndicator now renders distinct visual graphics for 3 health states:
+        * "healthy": Green glowing circle with checkmark
+        * "degraded": Orange glowing circle with exclamation mark
+        * "disconnected": Red glowing circle with cross mark
+    - Status Card displays live connection state (Connected / Degraded / Disconnected)
+      with the specific health reason / anomaly details in the subtitle.
+    - Packet Loss cell in grid 1 is now fully wired with live rolling loss %
+      and color-coded by severity (Green <= 1%, Orange <= 10%, Red > 10%).
+    - Ping and Jitter cells feature updated color thresholds for degraded states.
+    - Current Test widget in History tab shows real-time target ping.
 """
 
 from __future__ import annotations
@@ -108,41 +104,75 @@ def _metric_cell(label: str, value: str, unit: str = "",
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Status Indicator — painted green/orange/red circle with checkmark
+# Status Indicator — painted green/orange/red circle with symbol
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _StatusIndicator(QWidget):
-    """Filled colored circle with checkmark drawn via QPainter."""
+    """
+    Dynamic status indicator drawn via QPainter.
 
-    def __init__(self, connected: bool = False, parent=None):
+    Supports 3 health states:
+        - "healthy": Green glow + circle + checkmark
+        - "degraded": Orange glow + circle + exclamation mark
+        - "disconnected": Red glow + circle + cross mark
+    """
+
+    def __init__(self, status: str = "disconnected", parent=None):
         super().__init__(parent)
         self.setFixedSize(36, 36)
-        self._color = QColor(_GREEN if connected else _RED)
+        self._status = status
+
+    def set_status(self, status: str) -> None:
+        """Update status and repaint."""
+        if self._status != status:
+            self._status = status
+            self.update()
 
     def set_connected(self, connected: bool) -> None:
-        """Update color and schedule a repaint (called from UI thread via QTimer)."""
-        self._color = QColor(_GREEN if connected else _RED)
-        self.update()
+        """Legacy helper for binary connection state."""
+        self.set_status("healthy" if connected else "disconnected")
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        glow = QColor(self._color)
+        if self._status == "healthy":
+            color = QColor(_GREEN)
+        elif self._status == "degraded":
+            color = QColor(_ORANGE)
+        else:
+            color = QColor(_RED)
+
+        # Outer glow ring
+        glow = QColor(color)
         glow.setAlpha(40)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QBrush(glow))
         p.drawEllipse(2, 2, 32, 32)
 
-        p.setBrush(QBrush(self._color))
+        # Filled central circle
+        p.setBrush(QBrush(color))
         p.drawEllipse(6, 6, 24, 24)
 
+        # Foreground symbol
         p.setPen(QPen(QColor("white"), 2.5,
                       Qt.PenStyle.SolidLine,
                       Qt.PenCapStyle.RoundCap,
                       Qt.PenJoinStyle.RoundJoin))
-        p.drawLine(11, 18, 16, 23)
-        p.drawLine(16, 23, 25, 13)
+
+        if self._status == "healthy":
+            # Checkmark
+            p.drawLine(11, 18, 16, 23)
+            p.drawLine(16, 23, 25, 13)
+        elif self._status == "degraded":
+            # Exclamation point
+            p.drawLine(18, 12, 18, 20)
+            p.drawPoint(18, 24)
+        else:
+            # Cross mark
+            p.drawLine(13, 13, 23, 23)
+            p.drawLine(23, 13, 13, 23)
+
         p.end()
 
 
@@ -200,15 +230,6 @@ class _TitleBar(QFrame):
 class _DashboardView(QWidget):
     """
     Main metrics panel. Refreshes every 2 seconds from the NetworkMonitor.
-
-    Sections (top → bottom):
-        1. Connection status card  ← updated: connected state, interface name
-        2. Download / Upload speed ← updated: real KB/s from psutil
-        3. Ping / Jitter / Packet Loss ← Ping + Jitter live; Packet Loss M4
-        4. DNS / IPv4 / IPv6       ← placeholder until Milestone 5
-        5. Latency line chart      ← updated: real RTT history
-        6. Activity bar chart      ← updated: real bandwidth history
-        7. Footer                  ← updated: live uptime counter
     """
 
     def __init__(self, monitor: NetworkMonitor, parent=None):
@@ -217,21 +238,21 @@ class _DashboardView(QWidget):
         self.setStyleSheet("background-color: #0f1117;")
 
         # Widget references updated by _refresh()
-        self._ind:          _StatusIndicator | None = None
-        self._lbl_status:   QLabel | None = None
-        self._lbl_iface:    QLabel | None = None
-        self._lbl_dl:       QLabel | None = None
-        self._lbl_ul:       QLabel | None = None
-        self._lbl_ping:     QLabel | None = None
-        self._lbl_jitter:   QLabel | None = None
-        self._lbl_uptime:   QLabel | None = None
-        self._latency_chart: LatencyChart | None = None
+        self._ind:            _StatusIndicator | None = None
+        self._lbl_status:     QLabel | None = None
+        self._lbl_reason:     QLabel | None = None
+        self._lbl_bars:       QLabel | None = None
+        self._lbl_dl:         QLabel | None = None
+        self._lbl_ul:         QLabel | None = None
+        self._lbl_ping:       QLabel | None = None
+        self._lbl_jitter:     QLabel | None = None
+        self._lbl_pkt_loss:   QLabel | None = None
+        self._lbl_uptime:     QLabel | None = None
+        self._latency_chart:  LatencyChart | None = None
         self._activity_chart: ActivityChart | None = None
 
         self._build()
 
-        # Refresh the display every 2 seconds.
-        # QTimer fires on the main Qt thread — safe to update widgets here.
         timer = QTimer(self)
         timer.timeout.connect(self._refresh)
         timer.start(2000)
@@ -281,21 +302,21 @@ class _DashboardView(QWidget):
         row.setContentsMargins(14, 0, 14, 0)
         row.setSpacing(10)
 
-        self._ind = _StatusIndicator(connected=False)
+        self._ind = _StatusIndicator(status="disconnected")
         row.addWidget(self._ind)
 
         col = QVBoxLayout()
         col.setSpacing(1)
         self._lbl_status = _lbl("Connecting…", _MUTED, 15, bold=True)
-        self._lbl_iface  = _lbl("Waiting for monitor…", _MUTED, 10)
+        self._lbl_reason = _lbl("Waiting for monitor…", _MUTED, 10)
         col.addWidget(self._lbl_status)
-        col.addWidget(self._lbl_iface)
+        col.addWidget(self._lbl_reason)
         row.addLayout(col)
         row.addStretch()
 
-        bars = _lbl("▁▃▅▇", _GREEN, 16)
-        bars.setStyleSheet(bars.styleSheet() + " letter-spacing:2px;")
-        row.addWidget(bars)
+        self._lbl_bars = _lbl("▁▃▅▇", _GREEN, 16)
+        self._lbl_bars.setStyleSheet(self._lbl_bars.styleSheet() + " letter-spacing:2px;")
+        row.addWidget(self._lbl_bars)
         return card
 
     def _make_speed_row(self) -> QFrame:
@@ -340,16 +361,16 @@ class _DashboardView(QWidget):
         return card
 
     def _make_metric_row1(self) -> QWidget:
-        """Ping | Jitter | Packet Loss — Ping + Jitter live; Packet Loss M4."""
+        """Ping | Jitter | Packet Loss — all live metrics in Milestone 4."""
         w = QWidget()
         w.setStyleSheet("background:transparent;")
         g = QGridLayout(w)
         g.setContentsMargins(0, 0, 0, 0)
         g.setSpacing(6)
 
-        ping_cell,  self._lbl_ping   = _metric_cell("Ping",       "—", "ms", _GREEN)
-        jit_cell,   self._lbl_jitter = _metric_cell("Jitter",     "—", "ms", _GREEN)
-        pkt_cell,   _                = _metric_cell("Packet Loss", "—", "%",  _MUTED)
+        ping_cell, self._lbl_ping     = _metric_cell("Ping",        "—", "ms", _GREEN)
+        jit_cell,  self._lbl_jitter   = _metric_cell("Jitter",      "—", "ms", _GREEN)
+        pkt_cell,  self._lbl_pkt_loss = _metric_cell("Packet Loss", "0", "%",  _GREEN)
 
         g.addWidget(ping_cell, 0, 0)
         g.addWidget(jit_cell,  0, 1)
@@ -357,7 +378,7 @@ class _DashboardView(QWidget):
         return w
 
     def _make_metric_row2(self) -> QWidget:
-        """DNS | IPv4 | IPv6 — all placeholder until Milestone 5."""
+        """DNS | IPv4 | IPv6 — placeholder until Milestone 5."""
         w = QWidget()
         w.setStyleSheet("background:transparent;")
         g = QGridLayout(w)
@@ -385,7 +406,7 @@ class _DashboardView(QWidget):
         self._lbl_uptime = _lbl("⏱  Uptime: —:——:——", _DIM, 10)
         row.addWidget(self._lbl_uptime)
         row.addStretch()
-        row.addWidget(_lbl("Test Server: Cloudflare", _DIM, 10))
+        row.addWidget(_lbl("Test Server: Multi-Probe", _DIM, 10))
         row.addSpacing(4)
         row.addWidget(_lbl("●", _GREEN, 10))
         return bar
@@ -394,29 +415,44 @@ class _DashboardView(QWidget):
 
     def _refresh(self) -> None:
         """
-        Called every 2 seconds by QTimer.
-
-        Reads a snapshot of NetworkState from the monitor (thread-safe copy)
-        and updates all visible widgets. Runs entirely on the Qt main thread.
+        Called every 2 seconds by QTimer on the main Qt thread.
         """
         state: NetworkState = self._monitor.state
+        status = state.health_status
 
-        # ── Status card ───────────────────────────────────────────────────
-        connected = state.is_connected
+        # ── Status indicator & card ───────────────────────────────────────
         if self._ind:
-            self._ind.set_connected(connected)
+            self._ind.set_status(status)
+
+        if status == "healthy":
+            title_text = "Connected"
+            title_color = _GREEN
+        elif status == "degraded":
+            title_text = "Degraded"
+            title_color = _ORANGE
+        else:
+            title_text = "Disconnected"
+            title_color = _RED
+
         if self._lbl_status:
-            self._lbl_status.setText("Connected" if connected else "Disconnected")
-            color = _GREEN if connected else _RED
+            self._lbl_status.setText(title_text)
             self._lbl_status.setStyleSheet(
-                f"{_LBL} color:{color}; font-size:15px; font-weight:bold;"
+                f"{_LBL} color:{title_color}; font-size:15px; font-weight:bold;"
             )
-        if self._lbl_iface:
-            self._lbl_iface.setText(state.interface_name)
+
+        if self._lbl_reason:
+            if state.is_connected:
+                sub = f"{state.interface_name} · {state.health_reason}"
+            else:
+                sub = state.health_reason
+            self._lbl_reason.setText(sub)
+
+        if self._lbl_bars:
+            self._lbl_bars.setStyleSheet(
+                f"{_LBL} color:{title_color}; font-size:16px; letter-spacing:2px;"
+            )
 
         # ── Speed row ─────────────────────────────────────────────────────
-        # Convert KB/s → Mbps:  KB/s × 8 / 1000 = Mbps
-        # (1 byte = 8 bits; 1 Mbps = 1,000 Kbps)
         if self._lbl_dl:
             dl_mbps = state.download_kbps * 8 / 1000
             self._lbl_dl.setText(f"{dl_mbps:.1f}")
@@ -424,12 +460,11 @@ class _DashboardView(QWidget):
             ul_mbps = state.upload_kbps * 8 / 1000
             self._lbl_ul.setText(f"{ul_mbps:.1f}")
 
-        # ── Latency + jitter ──────────────────────────────────────────────
+        # ── Latency, Jitter, Packet Loss ──────────────────────────────────
         if self._lbl_ping:
             if state.latency_ms > 0:
                 self._lbl_ping.setText(f"{state.latency_ms:.0f}")
-                # Color the ping value: green < 80ms, orange < 150ms, red otherwise
-                color = _GREEN if state.latency_ms < 80 else (_ORANGE if state.latency_ms < 150 else _RED)
+                color = _GREEN if state.latency_ms < 100 else (_ORANGE if state.latency_ms < 150 else _RED)
                 self._lbl_ping.setStyleSheet(
                     f"{_LBL} color:{color}; font-size:15px; font-weight:bold;"
                 )
@@ -439,12 +474,20 @@ class _DashboardView(QWidget):
         if self._lbl_jitter:
             if state.jitter_ms > 0:
                 self._lbl_jitter.setText(f"{state.jitter_ms:.0f}")
-                color = _GREEN if state.jitter_ms < 15 else (_ORANGE if state.jitter_ms < 40 else _RED)
+                color = _GREEN if state.jitter_ms < 15 else (_ORANGE if state.jitter_ms < 35 else _RED)
                 self._lbl_jitter.setStyleSheet(
                     f"{_LBL} color:{color}; font-size:15px; font-weight:bold;"
                 )
             else:
                 self._lbl_jitter.setText("—")
+
+        if self._lbl_pkt_loss:
+            loss = state.packet_loss_pct
+            self._lbl_pkt_loss.setText(f"{loss:.0f}")
+            color = _GREEN if loss <= 1.0 else (_ORANGE if loss <= 10.0 else _RED)
+            self._lbl_pkt_loss.setStyleSheet(
+                f"{_LBL} color:{color}; font-size:15px; font-weight:bold;"
+            )
 
         # ── Charts ────────────────────────────────────────────────────────
         if self._latency_chart and state.latency_history:
@@ -464,7 +507,7 @@ class _DashboardView(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# History View — events, diagnostics, network details (unchanged from M2)
+# History View — events, diagnostics, network details
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _HistoryView(QWidget):
