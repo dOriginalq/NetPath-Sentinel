@@ -27,7 +27,47 @@ This will be the primary design reference for Milestone 2.
 
 ---
 
-## 2026-08-20 — Milestone 1: Basic Tray Application
+## 2026-08-20 — Milestone 2: Popup Dashboard UI
+
+**Status**: ✅ Complete
+
+### What was done
+
+- Implemented `ui/charts.py`:
+  - `LatencyChart` — green fill line graph (pyqtgraph) with mock sine-wave latency data
+  - `ActivityChart` — side-by-side blue/purple bar chart with mock throughput data
+  - Both expose `update_data()` hooks ready for Milestone 3 real data wiring
+  - Mock data clearly labeled in chart headers
+
+- Implemented full `ui/dashboard.py` (M1 placeholder replaced):
+  - `_TitleBar` — draggable header, ⚙/−/✕ buttons, close hides (doesn't quit)
+  - `_StatusIndicator` — custom-painted green circle with checkmark (state-aware at M3+)
+  - `_DashboardView` — scrollable panel: status card, speed row (↓/↑), 3-col metric grids (Ping/Jitter/PacketLoss, DNS/IPv4/IPv6), LatencyChart, ActivityChart, footer
+  - `_HistoryView` — scrollable panel: recent events list, current test target, network details (IP/Public IP/ASN/Route), Run Diagnostics button
+  - `_SettingsView` — placeholder for a future milestone
+  - `_NavBar` — three-tab bottom nav (Dashboard / History / Settings) with active blue underline
+
+- Fixed pyqtgraph API incompatibility (`tickTextSize` is not a valid `setStyle` kwarg in the installed version; removed it)
+- Created `tests/test_milestone2.py` — 8 additional tests (all passed)
+
+### Testing results
+
+```
+17 passed in 0.51s  (9 M1 + 8 M2)
+App process state after 6s: Running
+No errors or tracebacks
+```
+
+### Key learnings
+
+- pyqtgraph's `AxisItem.setStyle()` only accepts specific kwargs (`tickLength`, `tickTextOffset`, etc.) — always check the installed version's API
+- `fillLevel=0` on a `pg.PlotDataItem` with a `brush` creates the filled area under the latency line
+- `pg.BarGraphItem` offsets (`x ± 0.22`) create side-by-side grouped bars without a dedicated group-bar API
+- `QStackedWidget` is the cleanest way to implement tabbed content without using `QTabWidget` (which has its own opinionated styling)
+
+---
+
+
 
 **Status**: ✅ Complete
 
