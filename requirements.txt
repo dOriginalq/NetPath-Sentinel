@@ -1,0 +1,23 @@
+# NetPath Sentinel — Python Dependencies
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# Minimum Python version: 3.12
+
+# ----- UI Framework -----
+# PySide6: Qt for Python — used for the tray icon, popup dashboard, and all UI elements.
+PySide6>=6.7.0
+
+# ----- Charting -----
+# pyqtgraph: Fast, real-time plotting designed for Qt applications.
+# Used for the latency and activity charts in the dashboard.
+pyqtgraph>=0.13.7
+
+# ----- Networking -----
+# requests: Simple HTTP library used for public IP lookup and HTTP connectivity tests.
+requests>=2.32.0
+
+# ----- Testing -----
+# pytest: Test runner for all unit and integration tests.
+pytest>=8.0.0
