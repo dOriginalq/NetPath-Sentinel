@@ -1,19 +1,13 @@
 """
 ui/dashboard.py — Full Popup Dashboard Window
 
-Milestone 4: Enhanced Connection Health Monitoring UI.
+Milestone 5: Integrated DNS / IPv4 / IPv6 Protocol Monitoring UI.
 
-What changed from Milestone 3:
-    - _StatusIndicator now renders distinct visual graphics for 3 health states:
-        * "healthy": Green glowing circle with checkmark
-        * "degraded": Orange glowing circle with exclamation mark
-        * "disconnected": Red glowing circle with cross mark
-    - Status Card displays live connection state (Connected / Degraded / Disconnected)
-      with the specific health reason / anomaly details in the subtitle.
-    - Packet Loss cell in grid 1 is now fully wired with live rolling loss %
-      and color-coded by severity (Green <= 1%, Orange <= 10%, Red > 10%).
-    - Ping and Jitter cells feature updated color thresholds for degraded states.
-    - Current Test widget in History tab shows real-time target ping.
+What changed from Milestone 4:
+    - Wired DNS resolution latency and failure detection in Metric Grid 2.
+    - Wired IPv4 connectivity verification ("Active" / "Failed").
+    - Wired IPv6 dual-stack connectivity verification ("Active" / "Failed" / "Unavailable").
+    - Updated Status Card with DNS anomaly integration.
 """
 
 from __future__ import annotations
@@ -247,6 +241,9 @@ class _DashboardView(QWidget):
         self._lbl_ping:       QLabel | None = None
         self._lbl_jitter:     QLabel | None = None
         self._lbl_pkt_loss:   QLabel | None = None
+        self._lbl_dns:        QLabel | None = None
+        self._lbl_ipv4:       QLabel | None = None
+        self._lbl_ipv6:       QLabel | None = None
         self._lbl_uptime:     QLabel | None = None
         self._latency_chart:  LatencyChart | None = None
         self._activity_chart: ActivityChart | None = None
@@ -361,7 +358,7 @@ class _DashboardView(QWidget):
         return card
 
     def _make_metric_row1(self) -> QWidget:
-        """Ping | Jitter | Packet Loss — all live metrics in Milestone 4."""
+        """Ping | Jitter | Packet Loss — all live metrics."""
         w = QWidget()
         w.setStyleSheet("background:transparent;")
         g = QGridLayout(w)
@@ -378,16 +375,16 @@ class _DashboardView(QWidget):
         return w
 
     def _make_metric_row2(self) -> QWidget:
-        """DNS | IPv4 | IPv6 — placeholder until Milestone 5."""
+        """DNS | IPv4 | IPv6 — all live metrics in Milestone 5."""
         w = QWidget()
         w.setStyleSheet("background:transparent;")
         g = QGridLayout(w)
         g.setContentsMargins(0, 0, 0, 0)
         g.setSpacing(6)
 
-        dns_cell,  _ = _metric_cell("DNS",  "—",      "ms", _MUTED)
-        ip4_cell,  _ = _metric_cell("IPv4", "Active", "",   _GREEN)
-        ip6_cell,  _ = _metric_cell("IPv6", "Active", "",   _GREEN)
+        dns_cell,  self._lbl_dns  = _metric_cell("DNS",  "—", "ms", _GREEN)
+        ip4_cell,  self._lbl_ipv4 = _metric_cell("IPv4", "—", "",   _GREEN)
+        ip6_cell,  self._lbl_ipv6 = _metric_cell("IPv6", "—", "",   _GREEN)
 
         g.addWidget(dns_cell, 0, 0)
         g.addWidget(ip4_cell, 0, 1)
@@ -488,6 +485,33 @@ class _DashboardView(QWidget):
             self._lbl_pkt_loss.setStyleSheet(
                 f"{_LBL} color:{color}; font-size:15px; font-weight:bold;"
             )
+
+        # ── DNS, IPv4, IPv6 (Milestone 5) ─────────────────────────────────
+        if self._lbl_dns:
+            if state.dns_status == "ok":
+                self._lbl_dns.setText(f"{state.dns_latency_ms:.0f}")
+                color = _GREEN if state.dns_latency_ms < 50 else (_ORANGE if state.dns_latency_ms < 120 else _RED)
+                self._lbl_dns.setStyleSheet(f"{_LBL} color:{color}; font-size:15px; font-weight:bold;")
+            elif state.dns_status in ("timeout", "failed"):
+                self._lbl_dns.setText(state.dns_status.capitalize())
+                self._lbl_dns.setStyleSheet(f"{_LBL} color:{_RED}; font-size:12px; font-weight:bold;")
+            else:
+                self._lbl_dns.setText("—")
+
+        if self._lbl_ipv4:
+            self._lbl_ipv4.setText(state.ipv4_status)
+            color = _GREEN if state.ipv4_status == "Active" else (_RED if state.ipv4_status == "Failed" else _MUTED)
+            self._lbl_ipv4.setStyleSheet(f"{_LBL} color:{color}; font-size:13px; font-weight:bold;")
+
+        if self._lbl_ipv6:
+            self._lbl_ipv6.setText(state.ipv6_status)
+            if state.ipv6_status == "Active":
+                color = _GREEN
+            elif state.ipv6_status == "Failed":
+                color = _RED
+            else:
+                color = _MUTED
+            self._lbl_ipv6.setStyleSheet(f"{_LBL} color:{color}; font-size:13px; font-weight:bold;")
 
         # ── Charts ────────────────────────────────────────────────────────
         if self._latency_chart and state.latency_history:

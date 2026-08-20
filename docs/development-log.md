@@ -180,4 +180,34 @@ No errors or tracebacks
 
 ---
 
+## 2026-08-20 — Milestone 5: DNS / IPv4 / IPv6 Monitoring
+
+**Status**: ✅ Complete
+
+### What was done
+
+- **DNS Resolution Monitoring**:
+  - Implemented `measure_dns_resolution()` and `measure_multi_dns()` in `monitoring/dns_monitor.py`.
+  - Measures DNS query latency using system resolver, detects timeouts and failures, and extracts resolved IP addresses.
+- **Dual-Stack Transport Verification**:
+  - Implemented `check_ipv4_connectivity()` via explicit `AF_INET` socket probing.
+  - Implemented `check_ipv6_connectivity()` via explicit `AF_INET6` socket probing to public IPv6 targets (`2001:4860:4860::8888`), gracefully classifying states (`Active`, `Failed`, or `Unavailable`).
+- **Composite Health Integration**:
+  - Updated `evaluate_health_status()` in `monitoring/connectivity.py` to incorporate DNS health, flagging DNS timeouts, failures, and latency spikes ($\ge 100\text{ms}$).
+- **Dashboard UI Updates**:
+  - Wired live DNS resolution latency into the `DNS` metric cell with color coding ($<50\text{ms}$ Green, $<120\text{ms}$ Orange, $\ge 120\text{ms}$ or failure Red).
+  - Wired live `IPv4` and `IPv6` protocol status cells in Grid 2.
+- **Automated Tests**:
+  - Added `tests/test_milestone5.py` with 10 new tests covering DNS resolution, error handling, dual-stack socket checks, and state thread safety (58 total tests passing).
+
+### Testing results
+
+```
+58 passed in 1.29s
+App process state after 8s: Running
+No errors or tracebacks
+```
+
+---
+
 *Future milestones will be logged here as they are completed.*
