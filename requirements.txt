@@ -18,6 +18,11 @@ pyqtgraph>=0.13.7
 # requests: Simple HTTP library used for public IP lookup and HTTP connectivity tests.
 requests>=2.32.0
 
+# ----- System / Process Info -----
+# psutil: Cross-platform library for reading system resource usage.
+# Used to sample network interface byte counters for bandwidth measurement.
+psutil>=6.0.0
+
 # ----- Testing -----
 # pytest: Test runner for all unit and integration tests.
 pytest>=8.0.0

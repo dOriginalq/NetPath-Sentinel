@@ -1,45 +1,50 @@
 """
 ui/dashboard.py — Full Popup Dashboard Window
 
-Milestone 2: Complete UI based on assets/ui-reference.png.
+Milestone 3: _DashboardView now accepts the NetworkMonitor and refreshes
+live measurements every 2 seconds via a QTimer.
 
-Layout:
-    DashboardWindow (frameless QWidget, 420 × 650 px)
-    ├── _TitleBar        — draggable header with window controls
-    ├── QStackedWidget
-    │   ├── _DashboardView  — status, speed, metrics, charts
-    │   ├── _HistoryView    — recent events, test target, network details
-    │   └── _SettingsView   — placeholder for Milestone TBD
-    └── _NavBar          — three-tab bottom navigation bar
+What changed from Milestone 2:
+    - DashboardWindow accepts a NetworkMonitor parameter
+    - _DashboardView stores references to all updateable labels/widgets
+    - _DashboardView._refresh() reads monitor.state and updates the UI
+    - _StatusIndicator gains a set_connected() method
+    - Charts update with real latency and bandwidth history
+    - Placeholder values (—) are replaced with live readings as they arrive
 
-All metric values display "—" (placeholder) at Milestone 2.
-Chart data is clearly labeled MOCK DATA at Milestone 2.
-Real values will be wired in at Milestone 3+.
+What is still placeholder at Milestone 3:
+    - DNS response time (Milestone 5)
+    - IPv4 / IPv6 status (Milestone 5)
+    - Packet loss % (Milestone 4)
+    - Recent events list (Milestone 6)
+    - Network details / public IP / ASN (Milestone 8)
 """
 
 from __future__ import annotations
+
+from datetime import datetime
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QStackedWidget, QGridLayout,
 )
-from PySide6.QtCore import Qt, QPoint
-from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPixmap
+from PySide6.QtCore import Qt, QPoint, QTimer
+from PySide6.QtGui import QPainter, QColor, QPen, QBrush
 
 from netpath_sentinel.ui.styles import APP_STYLESHEET
 from netpath_sentinel.ui.charts import LatencyChart, ActivityChart
+from netpath_sentinel.monitoring.network_monitor import NetworkMonitor, NetworkState
 
 
-# ── Shared style snippets ─────────────────────────────────────────────────────
-_CARD = """
+# ── Shared style constants ────────────────────────────────────────────────────
+_CARD   = """
     QFrame {
         background-color: #1a1d24;
         border: 1px solid #252b38;
         border-radius: 8px;
     }
 """
-_LBL = "background: transparent; font-family: 'Segoe UI';"
-
+_LBL    = "background: transparent; font-family: 'Segoe UI';"
 _GREEN  = "#22c55e"
 _ORANGE = "#f59e0b"
 _RED    = "#ef4444"
@@ -49,22 +54,19 @@ _MUTED  = "#94a3b8"
 _DIM    = "#4a5568"
 
 
-# ── Small reusable helpers ────────────────────────────────────────────────────
+# ── Reusable helper functions ─────────────────────────────────────────────────
 
 def _lbl(text: str, color: str = "#e2e8f0", size: int = 12,
          bold: bool = False, align=Qt.AlignmentFlag.AlignLeft) -> QLabel:
-    """Create a styled QLabel."""
     l = QLabel(text)
-    weight = "bold" if bold else "normal"
     l.setStyleSheet(
-        f"{_LBL} color:{color}; font-size:{size}px; font-weight:{weight};"
+        f"{_LBL} color:{color}; font-size:{size}px; font-weight:{'bold' if bold else 'normal'};"
     )
     l.setAlignment(align)
     return l
 
 
 def _sep() -> QFrame:
-    """Thin horizontal divider line."""
     line = QFrame()
     line.setFixedHeight(1)
     line.setStyleSheet("background-color: #252b38; border: none;")
@@ -72,13 +74,12 @@ def _sep() -> QFrame:
 
 
 def _metric_cell(label: str, value: str, unit: str = "",
-                 color: str = _GREEN) -> QFrame:
+                 color: str = _GREEN) -> tuple[QFrame, QLabel]:
     """
-    A single compact metric cell used in the 3-column grids.
+    Create a single metric cell (label + live value).
 
-    Example:
-        Ping
-        24 ms        ← value in green
+    Returns:
+        (cell_frame, value_label) — caller stores the label ref for updates.
     """
     cell = QFrame()
     cell.setStyleSheet(_CARD)
@@ -89,7 +90,6 @@ def _metric_cell(label: str, value: str, unit: str = "",
     lbl_label = _lbl(label, _MUTED, 11, align=Qt.AlignmentFlag.AlignCenter)
     v.addWidget(lbl_label)
 
-    # Value + optional unit on the same row
     val_row = QWidget()
     val_row.setStyleSheet("background: transparent;")
     row = QHBoxLayout(val_row)
@@ -104,18 +104,46 @@ def _metric_cell(label: str, value: str, unit: str = "",
         row.addWidget(lbl_unit)
 
     v.addWidget(val_row)
-    return cell
+    return cell, lbl_val
 
 
-def _section_title(text: str) -> QWidget:
-    """Bold white section title with a muted 'View All' / 'Edit' link on the right."""
-    w = QWidget()
-    w.setStyleSheet("background: transparent;")
-    row = QHBoxLayout(w)
-    row.setContentsMargins(0, 0, 0, 0)
-    row.addWidget(_lbl(text, "#e2e8f0", 13, bold=True))
-    row.addStretch()
-    return w
+# ══════════════════════════════════════════════════════════════════════════════
+# Status Indicator — painted green/orange/red circle with checkmark
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _StatusIndicator(QWidget):
+    """Filled colored circle with checkmark drawn via QPainter."""
+
+    def __init__(self, connected: bool = False, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(36, 36)
+        self._color = QColor(_GREEN if connected else _RED)
+
+    def set_connected(self, connected: bool) -> None:
+        """Update color and schedule a repaint (called from UI thread via QTimer)."""
+        self._color = QColor(_GREEN if connected else _RED)
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        glow = QColor(self._color)
+        glow.setAlpha(40)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(glow))
+        p.drawEllipse(2, 2, 32, 32)
+
+        p.setBrush(QBrush(self._color))
+        p.drawEllipse(6, 6, 24, 24)
+
+        p.setPen(QPen(QColor("white"), 2.5,
+                      Qt.PenStyle.SolidLine,
+                      Qt.PenCapStyle.RoundCap,
+                      Qt.PenJoinStyle.RoundJoin))
+        p.drawLine(11, 18, 16, 23)
+        p.drawLine(16, 23, 25, 13)
+        p.end()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -123,15 +151,6 @@ def _section_title(text: str) -> QWidget:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _TitleBar(QFrame):
-    """
-    Custom frameless window title bar.
-
-    Provides:
-    - App icon + name (left)
-    - Settings / minimize / close buttons (right)
-    - Mouse drag support (the title bar is the drag handle)
-    """
-
     def __init__(self, on_close, parent=None):
         super().__init__(parent)
         self.setFixedHeight(44)
@@ -143,20 +162,17 @@ class _TitleBar(QFrame):
                 border-top-right-radius: 10px;
             }
         """)
-
         row = QHBoxLayout(self)
         row.setContentsMargins(14, 0, 10, 0)
         row.setSpacing(6)
 
-        icon = _lbl("📡", size=16)
-        title = _lbl("NetPath Sentinel", "#e2e8f0", 14, bold=True)
-        row.addWidget(icon)
-        row.addWidget(title)
+        row.addWidget(_lbl("📡", size=16))
+        row.addWidget(_lbl("NetPath Sentinel", "#e2e8f0", 14, bold=True))
         row.addStretch()
 
         for symbol, tip, cb in [
             ("⚙", "Settings (coming soon)", None),
-            ("−", "Hide dashboard", on_close),
+            ("−", "Hide dashboard",          on_close),
             ("✕", "Close (monitoring continues)", on_close),
         ]:
             btn = QPushButton(symbol)
@@ -167,11 +183,9 @@ class _TitleBar(QFrame):
                 if symbol == "✕" else ""
             )
             btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: transparent; border: none;
-                    color: #64748b; font-size: 13px; border-radius: 4px;
-                }}
-                QPushButton:hover {{ background-color: #2d3748; color: #e2e8f0; }}
+                QPushButton {{ background:transparent; border:none;
+                    color:#64748b; font-size:13px; border-radius:4px; }}
+                QPushButton:hover {{ background-color:#2d3748; color:#e2e8f0; }}
                 {hover_extra}
             """)
             if cb:
@@ -180,30 +194,49 @@ class _TitleBar(QFrame):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Dashboard View  (left panel of UI reference)
+# Dashboard View — live metrics panel
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _DashboardView(QWidget):
     """
-    Main metrics panel — mirrors the left side of assets/ui-reference.png.
+    Main metrics panel. Refreshes every 2 seconds from the NetworkMonitor.
 
     Sections (top → bottom):
-        1. Connection status card
-        2. Download / Upload speed row
-        3. Ping / Jitter / Packet Loss metric grid
-        4. DNS / IPv4 / IPv6 status grid
-        5. Latency line chart
-        6. Activity bar chart
-        7. Footer (uptime · test server)
-
-    All values show "—" placeholder at Milestone 2.
+        1. Connection status card  ← updated: connected state, interface name
+        2. Download / Upload speed ← updated: real KB/s from psutil
+        3. Ping / Jitter / Packet Loss ← Ping + Jitter live; Packet Loss M4
+        4. DNS / IPv4 / IPv6       ← placeholder until Milestone 5
+        5. Latency line chart      ← updated: real RTT history
+        6. Activity bar chart      ← updated: real bandwidth history
+        7. Footer                  ← updated: live uptime counter
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, monitor: NetworkMonitor, parent=None):
         super().__init__(parent)
+        self._monitor = monitor
         self.setStyleSheet("background-color: #0f1117;")
 
-        # Outer layout holds a scroll area so content is never clipped
+        # Widget references updated by _refresh()
+        self._ind:          _StatusIndicator | None = None
+        self._lbl_status:   QLabel | None = None
+        self._lbl_iface:    QLabel | None = None
+        self._lbl_dl:       QLabel | None = None
+        self._lbl_ul:       QLabel | None = None
+        self._lbl_ping:     QLabel | None = None
+        self._lbl_jitter:   QLabel | None = None
+        self._lbl_uptime:   QLabel | None = None
+        self._latency_chart: LatencyChart | None = None
+        self._activity_chart: ActivityChart | None = None
+
+        self._build()
+
+        # Refresh the display every 2 seconds.
+        # QTimer fires on the main Qt thread — safe to update widgets here.
+        timer = QTimer(self)
+        timer.timeout.connect(self._refresh)
+        timer.start(2000)
+
+    def _build(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -211,26 +244,28 @@ class _DashboardView(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setStyleSheet("""
-            QScrollArea { border: none; background: transparent; }
+            QScrollArea { border:none; background:transparent; }
             QScrollBar:vertical { background:#0f1117; width:5px; border-radius:3px; }
             QScrollBar::handle:vertical { background:#2d3748; border-radius:3px; }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
         """)
 
         content = QWidget()
-        content.setStyleSheet("background: #0f1117;")
+        content.setStyleSheet("background:#0f1117;")
         cl = QVBoxLayout(content)
         cl.setContentsMargins(12, 10, 12, 8)
         cl.setSpacing(7)
 
         cl.addWidget(self._make_status_card())
         cl.addWidget(self._make_speed_row())
-        cl.addWidget(self._make_metric_grid())
-        cl.addWidget(self._make_protocol_grid())
-        cl.addWidget(LatencyChart())
-        cl.addWidget(ActivityChart())
+        cl.addWidget(self._make_metric_row1())
+        cl.addWidget(self._make_metric_row2())
+
+        self._latency_chart  = LatencyChart()
+        self._activity_chart = ActivityChart()
+        cl.addWidget(self._latency_chart)
+        cl.addWidget(self._activity_chart)
         cl.addWidget(self._make_footer())
 
         scroll.setWidget(content)
@@ -239,141 +274,201 @@ class _DashboardView(QWidget):
     # ── Section builders ──────────────────────────────────────────────────
 
     def _make_status_card(self) -> QFrame:
-        """Green 'Connected' card with signal bars indicator."""
         card = QFrame()
         card.setFixedHeight(68)
         card.setStyleSheet(_CARD)
-
         row = QHBoxLayout(card)
         row.setContentsMargins(14, 0, 14, 0)
         row.setSpacing(10)
 
-        # Status circle indicator — drawn programmatically
-        indicator = _StatusIndicator(connected=True)
-        row.addWidget(indicator)
+        self._ind = _StatusIndicator(connected=False)
+        row.addWidget(self._ind)
 
-        # Status text
         col = QVBoxLayout()
         col.setSpacing(1)
-        col.addWidget(_lbl("Connected", _GREEN, 15, bold=True))
-        col.addWidget(_lbl("Network interface active  ·  placeholder", _MUTED, 10))
+        self._lbl_status = _lbl("Connecting…", _MUTED, 15, bold=True)
+        self._lbl_iface  = _lbl("Waiting for monitor…", _MUTED, 10)
+        col.addWidget(self._lbl_status)
+        col.addWidget(self._lbl_iface)
         row.addLayout(col)
         row.addStretch()
 
-        # Signal bars (unicode block characters)
         bars = _lbl("▁▃▅▇", _GREEN, 16)
-        bars.setStyleSheet(bars.styleSheet() + " letter-spacing: 2px;")
+        bars.setStyleSheet(bars.styleSheet() + " letter-spacing:2px;")
         row.addWidget(bars)
-
         return card
 
     def _make_speed_row(self) -> QFrame:
-        """Download / upload speed display."""
         card = QFrame()
         card.setFixedHeight(62)
         card.setStyleSheet(_CARD)
-
         row = QHBoxLayout(card)
         row.setContentsMargins(16, 0, 16, 0)
         row.setSpacing(0)
 
-        # Download side
         dl = QHBoxLayout()
         dl.setSpacing(8)
-        dl_arrow = _lbl("↓", _BLUE, 22, bold=True)
+        dl.addWidget(_lbl("↓", _BLUE, 22, bold=True))
         dl_col = QVBoxLayout()
         dl_col.setSpacing(0)
-        dl_col.addWidget(_lbl("—", "#e2e8f0", 20, bold=True))
+        self._lbl_dl = _lbl("—", "#e2e8f0", 20, bold=True)
+        dl_col.addWidget(self._lbl_dl)
         dl_col.addWidget(_lbl("Download", _MUTED, 10))
-        dl.addWidget(dl_arrow)
         dl.addLayout(dl_col)
         dl.addWidget(_lbl("Mbps", _MUTED, 11))
 
-        # Upload side
         ul = QHBoxLayout()
         ul.setSpacing(8)
-        ul_arrow = _lbl("↑", _PURPLE, 22, bold=True)
+        ul.addWidget(_lbl("↑", _PURPLE, 22, bold=True))
         ul_col = QVBoxLayout()
         ul_col.setSpacing(0)
-        ul_col.addWidget(_lbl("—", "#e2e8f0", 20, bold=True))
+        self._lbl_ul = _lbl("—", "#e2e8f0", 20, bold=True)
+        ul_col.addWidget(self._lbl_ul)
         ul_col.addWidget(_lbl("Upload", _MUTED, 10))
-        ul.addWidget(ul_arrow)
         ul.addLayout(ul_col)
         ul.addWidget(_lbl("Mbps", _MUTED, 11))
 
-        row.addLayout(dl)
-        row.addStretch()
-
-        # Divider
         div = QFrame()
         div.setFixedSize(1, 32)
         div.setStyleSheet("background:#252b38; border:none;")
-        row.addWidget(div)
 
+        row.addLayout(dl)
+        row.addStretch()
+        row.addWidget(div)
         row.addStretch()
         row.addLayout(ul)
-
         return card
 
-    def _make_metric_grid(self) -> QWidget:
-        """3-column grid: Ping | Jitter | Packet Loss"""
+    def _make_metric_row1(self) -> QWidget:
+        """Ping | Jitter | Packet Loss — Ping + Jitter live; Packet Loss M4."""
         w = QWidget()
-        w.setStyleSheet("background: transparent;")
+        w.setStyleSheet("background:transparent;")
         g = QGridLayout(w)
         g.setContentsMargins(0, 0, 0, 0)
         g.setSpacing(6)
-        g.addWidget(_metric_cell("Ping",         "—",    "ms",  _GREEN),  0, 0)
-        g.addWidget(_metric_cell("Jitter",        "—",    "ms",  _GREEN),  0, 1)
-        g.addWidget(_metric_cell("Packet Loss",   "—",    "%",   _GREEN),  0, 2)
+
+        ping_cell,  self._lbl_ping   = _metric_cell("Ping",       "—", "ms", _GREEN)
+        jit_cell,   self._lbl_jitter = _metric_cell("Jitter",     "—", "ms", _GREEN)
+        pkt_cell,   _                = _metric_cell("Packet Loss", "—", "%",  _MUTED)
+
+        g.addWidget(ping_cell, 0, 0)
+        g.addWidget(jit_cell,  0, 1)
+        g.addWidget(pkt_cell,  0, 2)
         return w
 
-    def _make_protocol_grid(self) -> QWidget:
-        """3-column grid: DNS | IPv4 | IPv6"""
+    def _make_metric_row2(self) -> QWidget:
+        """DNS | IPv4 | IPv6 — all placeholder until Milestone 5."""
         w = QWidget()
-        w.setStyleSheet("background: transparent;")
+        w.setStyleSheet("background:transparent;")
         g = QGridLayout(w)
         g.setContentsMargins(0, 0, 0, 0)
         g.setSpacing(6)
-        g.addWidget(_metric_cell("DNS",  "—",       "ms",     _GREEN), 0, 0)
-        g.addWidget(_metric_cell("IPv4", "Active",  "",        _GREEN), 0, 1)
-        g.addWidget(_metric_cell("IPv6", "Active",  "",        _GREEN), 0, 2)
+
+        dns_cell,  _ = _metric_cell("DNS",  "—",      "ms", _MUTED)
+        ip4_cell,  _ = _metric_cell("IPv4", "Active", "",   _GREEN)
+        ip6_cell,  _ = _metric_cell("IPv6", "Active", "",   _GREEN)
+
+        g.addWidget(dns_cell, 0, 0)
+        g.addWidget(ip4_cell, 0, 1)
+        g.addWidget(ip6_cell, 0, 2)
         return w
 
     def _make_footer(self) -> QFrame:
-        """Slim footer: uptime · test server indicator."""
         bar = QFrame()
         bar.setFixedHeight(34)
-        bar.setStyleSheet("QFrame { background: transparent; border-top: 1px solid #252b38; }")
-
+        bar.setStyleSheet(
+            "QFrame { background:transparent; border-top:1px solid #252b38; }"
+        )
         row = QHBoxLayout(bar)
         row.setContentsMargins(4, 0, 4, 0)
 
-        row.addWidget(_lbl("⏱  Uptime: —:——:——", _DIM, 10))
+        self._lbl_uptime = _lbl("⏱  Uptime: —:——:——", _DIM, 10)
+        row.addWidget(self._lbl_uptime)
         row.addStretch()
-
-        dot = _lbl("●", _GREEN, 10)
         row.addWidget(_lbl("Test Server: Cloudflare", _DIM, 10))
         row.addSpacing(4)
-        row.addWidget(dot)
-
+        row.addWidget(_lbl("●", _GREEN, 10))
         return bar
+
+    # ── Live data refresh ─────────────────────────────────────────────────
+
+    def _refresh(self) -> None:
+        """
+        Called every 2 seconds by QTimer.
+
+        Reads a snapshot of NetworkState from the monitor (thread-safe copy)
+        and updates all visible widgets. Runs entirely on the Qt main thread.
+        """
+        state: NetworkState = self._monitor.state
+
+        # ── Status card ───────────────────────────────────────────────────
+        connected = state.is_connected
+        if self._ind:
+            self._ind.set_connected(connected)
+        if self._lbl_status:
+            self._lbl_status.setText("Connected" if connected else "Disconnected")
+            color = _GREEN if connected else _RED
+            self._lbl_status.setStyleSheet(
+                f"{_LBL} color:{color}; font-size:15px; font-weight:bold;"
+            )
+        if self._lbl_iface:
+            self._lbl_iface.setText(state.interface_name)
+
+        # ── Speed row ─────────────────────────────────────────────────────
+        # Convert KB/s → Mbps:  KB/s × 8 / 1000 = Mbps
+        # (1 byte = 8 bits; 1 Mbps = 1,000 Kbps)
+        if self._lbl_dl:
+            dl_mbps = state.download_kbps * 8 / 1000
+            self._lbl_dl.setText(f"{dl_mbps:.1f}")
+        if self._lbl_ul:
+            ul_mbps = state.upload_kbps * 8 / 1000
+            self._lbl_ul.setText(f"{ul_mbps:.1f}")
+
+        # ── Latency + jitter ──────────────────────────────────────────────
+        if self._lbl_ping:
+            if state.latency_ms > 0:
+                self._lbl_ping.setText(f"{state.latency_ms:.0f}")
+                # Color the ping value: green < 80ms, orange < 150ms, red otherwise
+                color = _GREEN if state.latency_ms < 80 else (_ORANGE if state.latency_ms < 150 else _RED)
+                self._lbl_ping.setStyleSheet(
+                    f"{_LBL} color:{color}; font-size:15px; font-weight:bold;"
+                )
+            else:
+                self._lbl_ping.setText("—")
+
+        if self._lbl_jitter:
+            if state.jitter_ms > 0:
+                self._lbl_jitter.setText(f"{state.jitter_ms:.0f}")
+                color = _GREEN if state.jitter_ms < 15 else (_ORANGE if state.jitter_ms < 40 else _RED)
+                self._lbl_jitter.setStyleSheet(
+                    f"{_LBL} color:{color}; font-size:15px; font-weight:bold;"
+                )
+            else:
+                self._lbl_jitter.setText("—")
+
+        # ── Charts ────────────────────────────────────────────────────────
+        if self._latency_chart and state.latency_history:
+            self._latency_chart.update_data(state.latency_history)
+
+        if self._activity_chart and state.download_history:
+            self._activity_chart.update_data(
+                state.download_history, state.upload_history
+            )
+
+        # ── Uptime ────────────────────────────────────────────────────────
+        if self._lbl_uptime:
+            elapsed = datetime.now() - state.start_time
+            h, rem = divmod(int(elapsed.total_seconds()), 3600)
+            m, s   = divmod(rem, 60)
+            self._lbl_uptime.setText(f"⏱  Uptime: {h:02d}:{m:02d}:{s:02d}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# History View  (right panel of UI reference)
+# History View — events, diagnostics, network details (unchanged from M2)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _HistoryView(QWidget):
-    """
-    Events, diagnostics, and network details panel.
-    Mirrors the right side of assets/ui-reference.png.
-
-    Sections:
-        1. Recent Events list
-        2. Current Test target
-        3. Network Details (IP / Public IP / ASN / Route)
-        4. Run Diagnostics button
-    """
+    """Placeholder — will be populated with real events at Milestone 6."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -386,7 +481,7 @@ class _HistoryView(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setStyleSheet("""
-            QScrollArea { border: none; background: transparent; }
+            QScrollArea { border:none; background:transparent; }
             QScrollBar:vertical { background:#0f1117; width:5px; border-radius:3px; }
             QScrollBar::handle:vertical { background:#2d3748; border-radius:3px; }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
@@ -407,74 +502,48 @@ class _HistoryView(QWidget):
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
-    # ── Section builders ──────────────────────────────────────────────────
-
     def _make_events_section(self) -> QFrame:
-        """
-        Recent network events list.
-
-        At Milestone 2 this shows four static placeholder events.
-        At Milestone 6+ this will read from the SQLite event store.
-        """
         card = QFrame()
         card.setStyleSheet(_CARD)
         cl = QVBoxLayout(card)
         cl.setContentsMargins(14, 12, 14, 12)
         cl.setSpacing(6)
 
-        # Header row
         hdr = QWidget()
-        hdr.setStyleSheet("background: transparent;")
+        hdr.setStyleSheet("background:transparent;")
         hrow = QHBoxLayout(hdr)
         hrow.setContentsMargins(0, 0, 0, 0)
         hrow.addWidget(_lbl("Recent Events", "#e2e8f0", 13, bold=True))
         hrow.addStretch()
-        view_all = QPushButton("View All")
-        view_all.setStyleSheet("""
-            QPushButton {
-                background: transparent; border: none;
-                color: #3b82f6; font-size: 11px; padding: 0;
-            }
-            QPushButton:hover { color: #60a5fa; }
-        """)
-        hrow.addWidget(view_all)
+        va = QPushButton("View All")
+        va.setStyleSheet("QPushButton { background:transparent; border:none; color:#3b82f6; font-size:11px; padding:0; } QPushButton:hover { color:#60a5fa; }")
+        hrow.addWidget(va)
         cl.addWidget(hdr)
         cl.addWidget(_sep())
 
-        # Placeholder events — clearly marked as mock data
-        events = [
-            ("🔴", "—:——:——", "Connection Lost",     "—",     _RED),
-            ("🟠", "—:——:——", "High Latency",         "— ms",  _ORANGE),
-            ("🟠", "—:——:——", "DNS Timeout",          "—",     _ORANGE),
-            ("🟢", "—:——:——", "Connection Restored",  "—",     _GREEN),
-        ]
+        for icon, ts, name, dur, color in [
+            ("🔴", "—:——:——", "Connection Lost",     "—",    _RED),
+            ("🟠", "—:——:——", "High Latency",         "— ms", _ORANGE),
+            ("🟠", "—:——:——", "DNS Timeout",          "—",    _ORANGE),
+            ("🟢", "—:——:——", "Connection Restored",  "—",    _GREEN),
+        ]:
+            r = QWidget()
+            r.setStyleSheet("background:transparent;")
+            rl = QHBoxLayout(r)
+            rl.setContentsMargins(0, 2, 0, 2)
+            rl.setSpacing(8)
+            rl.addWidget(_lbl(icon, size=12))
+            rl.addWidget(_lbl(ts, _DIM, 11))
+            rl.addWidget(_lbl(name, color, 12))
+            rl.addStretch()
+            rl.addWidget(_lbl(dur, _MUTED, 11))
+            cl.addWidget(r)
 
-        for icon, ts, name, dur, color in events:
-            cl.addWidget(self._make_event_row(icon, ts, name, dur, color))
-
-        note = _lbl("[ Placeholder — live events from Milestone 6 ]", _DIM, 10)
-        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        cl.addWidget(note)
-
+        cl.addWidget(_lbl("[ Events populated at Milestone 6 ]", _DIM, 10,
+                          align=Qt.AlignmentFlag.AlignCenter))
         return card
 
-    def _make_event_row(self, icon, ts, name, dur, color) -> QWidget:
-        w = QWidget()
-        w.setStyleSheet("background: transparent;")
-        row = QHBoxLayout(w)
-        row.setContentsMargins(0, 2, 0, 2)
-        row.setSpacing(8)
-
-        row.addWidget(_lbl(icon, size=12))
-        row.addWidget(_lbl(ts, _DIM, 11))
-        row.addWidget(_lbl(name, color, 12))
-        row.addStretch()
-        row.addWidget(_lbl(dur, _MUTED, 11))
-
-        return w
-
     def _make_current_test(self) -> QFrame:
-        """Shows the currently monitored target host and its latest latency."""
         card = QFrame()
         card.setStyleSheet(_CARD)
         cl = QVBoxLayout(card)
@@ -482,49 +551,34 @@ class _HistoryView(QWidget):
         cl.setSpacing(6)
 
         hdr = QWidget()
-        hdr.setStyleSheet("background: transparent;")
+        hdr.setStyleSheet("background:transparent;")
         hrow = QHBoxLayout(hdr)
         hrow.setContentsMargins(0, 0, 0, 0)
         hrow.addWidget(_lbl("Current Test", "#e2e8f0", 13, bold=True))
         hrow.addStretch()
-        edit_btn = QPushButton("Edit")
-        edit_btn.setStyleSheet("""
-            QPushButton {
-                background: transparent; border: none;
-                color: #3b82f6; font-size: 11px; padding: 0;
-            }
-            QPushButton:hover { color: #60a5fa; }
-        """)
-        hrow.addWidget(edit_btn)
+        edit = QPushButton("Edit")
+        edit.setStyleSheet("QPushButton { background:transparent; border:none; color:#3b82f6; font-size:11px; padding:0; }")
+        hrow.addWidget(edit)
         cl.addWidget(hdr)
         cl.addWidget(_sep())
 
         body = QWidget()
-        body.setStyleSheet("background: transparent;")
+        body.setStyleSheet("background:transparent;")
         brow = QHBoxLayout(body)
         brow.setContentsMargins(0, 4, 0, 4)
         brow.setSpacing(12)
-
-        globe = _lbl("🌐", size=22)
-        info_col = QVBoxLayout()
-        info_col.setSpacing(1)
-        info_col.addWidget(_lbl("google.com", "#e2e8f0", 13, bold=True))
-        info_col.addWidget(_lbl("—.—.—.—", _MUTED, 11))
-        brow.addWidget(globe)
-        brow.addLayout(info_col)
+        brow.addWidget(_lbl("🌐", size=22))
+        info = QVBoxLayout()
+        info.setSpacing(1)
+        info.addWidget(_lbl("8.8.8.8  (Google DNS)", "#e2e8f0", 13, bold=True))
+        info.addWidget(_lbl("Primary probe target", _MUTED, 11))
+        brow.addLayout(info)
         brow.addStretch()
         brow.addWidget(_lbl("— ms", _GREEN, 15, bold=True))
-
         cl.addWidget(body)
         return card
 
     def _make_network_details(self) -> QFrame:
-        """
-        Local IP, public IP, ASN, route hop count.
-
-        At Milestone 2: all values are placeholder dashes.
-        At Milestone 8 (Network Diagnostics): populated with real data.
-        """
         card = QFrame()
         card.setStyleSheet(_CARD)
         cl = QVBoxLayout(card)
@@ -534,16 +588,14 @@ class _HistoryView(QWidget):
         cl.addWidget(_lbl("Network Details", "#e2e8f0", 13, bold=True))
         cl.addWidget(_sep())
 
-        rows = [
-            ("📶", "IP Address",  "—.—.—.—"),
-            ("🌐", "Public IP",   "—.—.—.—"),
-            ("🔗", "ASN",         "—"),
-            ("→",  "Route",       "— Hops"),
-        ]
-
-        for icon, label, value in rows:
+        for icon, label, value in [
+            ("📶", "IP Address", "—.—.—.—"),
+            ("🌐", "Public IP",  "—.—.—.—"),
+            ("🔗", "ASN",        "—"),
+            ("→",  "Route",      "— Hops"),
+        ]:
             r = QWidget()
-            r.setStyleSheet("background: transparent;")
+            r.setStyleSheet("background:transparent;")
             rl = QHBoxLayout(r)
             rl.setContentsMargins(0, 3, 0, 3)
             rl.setSpacing(8)
@@ -553,65 +605,45 @@ class _HistoryView(QWidget):
             rl.addWidget(_lbl(value, "#e2e8f0", 12))
             cl.addWidget(r)
 
-        note = _lbl("[ Populated at Milestone 8 — Diagnostics ]", _DIM, 10)
-        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        cl.addWidget(note)
-
+        cl.addWidget(_lbl("[ Populated at Milestone 8 — Diagnostics ]", _DIM, 10,
+                          align=Qt.AlignmentFlag.AlignCenter))
         return card
 
     def _make_diagnostics_row(self) -> QWidget:
-        """Run Diagnostics button + overflow menu."""
         w = QWidget()
-        w.setStyleSheet("background: transparent;")
+        w.setStyleSheet("background:transparent;")
         row = QHBoxLayout(w)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
 
-        diag_btn = QPushButton("⚡  Run Diagnostics")
-        diag_btn.setFixedHeight(38)
-        diag_btn.setStyleSheet("""
+        diag = QPushButton("⚡  Run Diagnostics")
+        diag.setFixedHeight(38)
+        diag.setStyleSheet("""
             QPushButton {
-                background: qlineargradient(
-                    x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #2563eb, stop:1 #3b82f6
-                );
-                color: #ffffff;
-                border: none;
-                border-radius: 7px;
-                font-size: 13px;
-                font-weight: bold;
-                font-family: 'Segoe UI';
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                    stop:0 #2563eb, stop:1 #3b82f6);
+                color:#fff; border:none; border-radius:7px;
+                font-size:13px; font-weight:bold; font-family:'Segoe UI';
             }
-            QPushButton:hover {
-                background: qlineargradient(
-                    x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #1d4ed8, stop:1 #2563eb
-                );
-            }
-            QPushButton:pressed { background: #1e40af; }
+            QPushButton:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                stop:0 #1d4ed8, stop:1 #2563eb); }
         """)
-        diag_btn.setToolTip("Network diagnostics will be implemented at Milestone 8")
+        diag.setToolTip("Implemented at Milestone 8")
 
-        more_btn = QPushButton("···")
-        more_btn.setFixedSize(38, 38)
-        more_btn.setStyleSheet("""
-            QPushButton {
-                background: #1a1d24;
-                color: #64748b;
-                border: 1px solid #252b38;
-                border-radius: 7px;
-                font-size: 16px;
-            }
-            QPushButton:hover { background: #252b38; color: #94a3b8; }
+        more = QPushButton("···")
+        more.setFixedSize(38, 38)
+        more.setStyleSheet("""
+            QPushButton { background:#1a1d24; color:#64748b;
+                border:1px solid #252b38; border-radius:7px; font-size:16px; }
+            QPushButton:hover { background:#252b38; color:#94a3b8; }
         """)
-
-        row.addWidget(diag_btn)
-        row.addWidget(more_btn)
+        row.addWidget(diag)
+        row.addWidget(more)
         return w
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Settings View  (placeholder for a future milestone)
+# Settings View (placeholder)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _SettingsView(QWidget):
@@ -630,25 +662,13 @@ class _SettingsView(QWidget):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _NavBar(QFrame):
-    """
-    Three-tab bottom navigation: Dashboard | History | Settings.
-
-    The active tab shows blue text with a blue top-border underline.
-    Switching tabs swaps the QStackedWidget page.
-    """
-
-    _BTN_STYLE = """
+    _BTN = """
         QPushButton {{
-            background: transparent;
-            border: none;
-            border-top: 2px solid {border};
-            color: {color};
-            font-size: 12px;
-            font-family: 'Segoe UI';
-            padding: 8px 0 6px 0;
-        }}
-        QPushButton:hover {{
-            color: #94a3b8;
+            background:transparent; border:none;
+            border-top:2px solid {border};
+            color:{color};
+            font-size:12px; font-family:'Segoe UI';
+            padding:8px 0 6px 0;
         }}
     """
 
@@ -656,91 +676,29 @@ class _NavBar(QFrame):
         super().__init__(parent)
         self.setFixedHeight(46)
         self.setStyleSheet("""
-            QFrame {
-                background-color: #13161e;
-                border-top: 1px solid #252b38;
-                border-bottom-left-radius: 10px;
-                border-bottom-right-radius: 10px;
-            }
+            QFrame { background-color:#13161e; border-top:1px solid #252b38;
+                border-bottom-left-radius:10px; border-bottom-right-radius:10px; }
         """)
-
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(0)
 
-        tabs = [
-            ("📊  Dashboard", 0),
-            ("🕐  History",   1),
-            ("⚙  Settings",  2),
-        ]
-
         self._buttons: list[QPushButton] = []
-        for label, idx in tabs:
+        for label, idx in [("📊  Dashboard", 0), ("🕐  History", 1), ("⚙  Settings", 2)]:
             btn = QPushButton(label)
-            btn.setCheckable(False)
             btn.clicked.connect(lambda _, i=idx: self._select(i, on_tab_change))
             self._buttons.append(btn)
             row.addWidget(btn)
 
-        self._select(0, on_tab_change)   # Dashboard is active by default
+        self._select(0, on_tab_change)
 
-    def _select(self, active_idx: int, on_tab_change) -> None:
+    def _select(self, active: int, on_tab_change) -> None:
         for i, btn in enumerate(self._buttons):
-            if i == active_idx:
-                btn.setStyleSheet(
-                    self._BTN_STYLE.format(border="#3b82f6", color="#3b82f6")
-                )
+            if i == active:
+                btn.setStyleSheet(self._BTN.format(border="#3b82f6", color="#3b82f6"))
             else:
-                btn.setStyleSheet(
-                    self._BTN_STYLE.format(border="transparent", color="#64748b")
-                )
-        on_tab_change(active_idx)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Status Indicator Widget (the green circle on the status card)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class _StatusIndicator(QWidget):
-    """
-    A small filled circle with a checkmark drawn using QPainter.
-
-    Green = connected / healthy
-    Orange = degraded
-    Red = disconnected
-
-    Drawing it in code means we can animate it or change its color
-    at runtime to reflect real network state (Milestone 3+).
-    """
-
-    def __init__(self, connected: bool = True, parent=None):
-        super().__init__(parent)
-        self.setFixedSize(36, 36)
-        self._color = QColor(_GREEN if connected else _RED)
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        # Outer glow ring
-        glow = QColor(self._color)
-        glow.setAlpha(40)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(glow))
-        p.drawEllipse(2, 2, 32, 32)
-
-        # Filled circle
-        p.setBrush(QBrush(self._color))
-        p.drawEllipse(6, 6, 24, 24)
-
-        # White checkmark
-        p.setPen(QPen(QColor("white"), 2.5,
-                       Qt.PenStyle.SolidLine,
-                       Qt.PenCapStyle.RoundCap,
-                       Qt.PenJoinStyle.RoundJoin))
-        p.drawLine(11, 18, 16, 23)
-        p.drawLine(16, 23, 25, 13)
-        p.end()
+                btn.setStyleSheet(self._BTN.format(border="transparent", color="#64748b"))
+        on_tab_change(active)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -749,17 +707,15 @@ class _StatusIndicator(QWidget):
 
 class DashboardWindow(QWidget):
     """
-    The NetPath Sentinel popup dashboard window.
-
-    420 × 650 px frameless window.
-    Appears near the system tray when the tray icon is clicked.
-    Closing or hiding does NOT exit the application.
+    420 × 650 px frameless popup dashboard.
+    Receives the NetworkMonitor and passes it to _DashboardView.
+    Closing hides the window — monitoring continues in the background.
     """
 
     WINDOW_WIDTH  = 420
     WINDOW_HEIGHT = 650
 
-    def __init__(self) -> None:
+    def __init__(self, monitor: NetworkMonitor) -> None:
         super().__init__()
 
         self.setWindowFlags(
@@ -770,8 +726,8 @@ class DashboardWindow(QWidget):
         self.setFixedSize(self.WINDOW_WIDTH, self.WINDOW_HEIGHT)
         self.setStyleSheet(APP_STYLESHEET)
 
-        # Drag support
         self._drag_start_pos: QPoint | None = None
+        self._monitor = monitor
 
         self._build_ui()
 
@@ -780,20 +736,15 @@ class DashboardWindow(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Title bar
         root.addWidget(_TitleBar(on_close=self.hide))
 
-        # Stacked content (three views)
         stack = QStackedWidget()
-        stack.addWidget(_DashboardView())
+        stack.addWidget(_DashboardView(self._monitor))
         stack.addWidget(_HistoryView())
         stack.addWidget(_SettingsView())
         root.addWidget(stack, 1)
 
-        # Bottom navigation
         root.addWidget(_NavBar(on_tab_change=stack.setCurrentIndex))
-
-    # ── Drag to move ──────────────────────────────────────────────────────
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:

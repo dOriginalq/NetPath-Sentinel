@@ -119,7 +119,7 @@ NetPath-Sentinel/
 | **M0** | Repository & Project Foundation | ✅ Complete |
 | **M1** | Basic Tray Application | ✅ Complete |
 | **M2** | Popup Dashboard UI | ✅ Complete |
-| **M3** | Basic Network Monitoring | 🔲 Pending |
+| **M3** | Basic Network Monitoring | ✅ Complete |
 | **M4** | Connectivity Health Monitoring | 🔲 Pending |
 | **M5** | DNS / IPv4 / IPv6 Monitoring | 🔲 Pending |
 | **M6** | SQLite Event Storage | 🔲 Pending |

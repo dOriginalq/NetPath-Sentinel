@@ -1,56 +1,67 @@
 """
 NetPath Sentinel — Application Entry Point
 
-Run this file to start the application:
+Run with:
     python src/netpath_sentinel/main.py
 
-What happens on startup:
-    1. A Qt application is created (Qt is the GUI framework under PySide6)
-    2. Qt is told NOT to quit when the dashboard window closes
-       (the app lives in the system tray, not in a window)
-    3. A system tray icon is created and shown
-    4. The Qt event loop starts — this blocks until the user exits
+Startup sequence:
+    1. Create Qt application
+    2. Disable Qt's default "quit on last window close" behaviour
+       (we are a tray app — closing the popup must not exit the process)
+    3. Create and START the background network monitor
+    4. Create the system tray icon (passes monitor to the dashboard)
+    5. Enter the Qt event loop — blocks until Exit is chosen from the tray
 """
 
 import sys
 import os
 
-# When running directly with `python src/netpath_sentinel/main.py`,
-# Python needs to know where to find the `netpath_sentinel` package.
-# This adds the `src/` directory to the module search path.
+# Add src/ to sys.path so `netpath_sentinel` is importable when running
+# this file directly with: python src/netpath_sentinel/main.py
 _src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
 
 from PySide6.QtWidgets import QApplication
+
 from netpath_sentinel.tray.tray import TrayIcon
+from netpath_sentinel.monitoring.network_monitor import NetworkMonitor
 
 
 def main() -> None:
-    """Create the application, show the tray icon, and start the event loop."""
+    """Entry point: create the Qt application, start monitoring, show tray."""
 
-    # QApplication is the foundation of every PySide6 app.
-    # sys.argv passes command-line arguments to Qt (e.g., --platform).
     app = QApplication(sys.argv)
 
-    # IMPORTANT: By default Qt quits when the last visible window closes.
-    # We are a tray application — the dashboard popup is not the application.
-    # Setting this to False means closing the dashboard keeps us running.
+    # Without this, Qt would exit when the dashboard popup is closed.
+    # We want the app to keep running in the tray instead.
     app.setQuitOnLastWindowClosed(False)
 
-    # Give the application a name (shown in some OS dialogs).
     app.setApplicationName("NetPath Sentinel")
     app.setApplicationVersion("0.1.0")
 
-    # Create and show the system tray icon.
-    tray = TrayIcon(app)
+    # Create and start the background monitor.
+    # The monitor runs in its own daemon thread — it will continue
+    # running as long as the application is alive.
+    monitor = NetworkMonitor()
+    monitor.start()
+
+    # Create the tray icon. It receives the monitor so it can pass it
+    # to the dashboard, which uses it to display live measurements.
+    tray = TrayIcon(app, monitor)
     tray.show()
 
     print("[NetPath Sentinel] Running in system tray. Right-click the tray icon to exit.")
 
-    # app.exec() starts the Qt event loop.
-    # This blocks here until the application exits (e.g., user clicks Exit).
-    sys.exit(app.exec())
+    # Enter the Qt event loop. This call blocks until app.quit() is called
+    # (e.g., when the user clicks Exit from the tray menu).
+    exit_code = app.exec()
+
+    # Clean up: signal the monitor thread to stop before exiting.
+    # (daemon=True means it would be killed anyway, but explicit is cleaner)
+    monitor.stop()
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

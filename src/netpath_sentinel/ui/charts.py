@@ -106,7 +106,7 @@ class LatencyChart(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(2)
-        layout.addWidget(_chart_header("Latency (ms)", "Last 60 sec  ·  mock data"))
+        layout.addWidget(_chart_header("Latency (ms)", "Last 60 sec"))
 
         pw = pg.PlotWidget()
         pw.setFixedHeight(96)
@@ -136,9 +136,7 @@ class LatencyChart(QWidget):
 
     def update_data(self, values: list[float]) -> None:
         """
-        Replace chart data with real measurements.
-
-        Called by the monitoring system at Milestone 3+.
+        Replace chart data with real RTT measurements.
 
         Args:
             values: Up to 60 RTT values in milliseconds, oldest → newest.
@@ -149,6 +147,10 @@ class LatencyChart(QWidget):
         pen   = pg.mkPen(color="#22c55e", width=1.8)
         brush = pg.mkBrush(34, 197, 94, 38)
         self._curve = self._pw.plot(x, values[-n:], pen=pen, fillLevel=0, brush=brush)
+        # Auto-scale Y based on actual values with 20% headroom
+        if values:
+            max_val = max(values[-n:])
+            self._pw.setYRange(0, max(max_val * 1.2, 50), padding=0)
 
 
 class ActivityChart(QWidget):
@@ -195,7 +197,7 @@ class ActivityChart(QWidget):
         row.addSpacing(8)
         row.addWidget(_leg("↑ Upload", "#a855f7"))
         row.addSpacing(8)
-        row.addWidget(_leg("Last 60 sec  ·  mock data", "#4a5568"))
+        row.addWidget(_leg("Last 60 sec", "#4a5568"))
         layout.addWidget(hdr)
 
         # Plot
@@ -242,3 +244,8 @@ class ActivityChart(QWidget):
                                           brush="#3b82f6", pen=pg.mkPen(None)))
         self._pw.addItem(pg.BarGraphItem(x=xs_ul, height=ul_values[-n:], width=bw,
                                           brush="#a855f7", pen=pg.mkPen(None)))
+        # Auto-scale Y to the actual max speed with 20% headroom
+        all_vals = dl_values[-n:] + ul_values[-n:]
+        if all_vals:
+            max_val = max(all_vals)
+            self._pw.setYRange(0, max(max_val * 1.2, 10), padding=0)
