@@ -117,7 +117,7 @@ NetPath-Sentinel/
 | Milestone | Description | Status |
 |-----------|-------------|--------|
 | **M0** | Repository & Project Foundation | ✅ Complete |
-| **M1** | Basic Tray Application | 🔲 Pending |
+| **M1** | Basic Tray Application | ✅ Complete |
 | **M2** | Popup Dashboard UI | 🔲 Pending |
 | **M3** | Basic Network Monitoring | 🔲 Pending |
 | **M4** | Connectivity Health Monitoring | 🔲 Pending |
